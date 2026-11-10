@@ -18,7 +18,8 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
-        # 根据项目需要，可能还需要额外安装 NDK，可通过下面的步骤补充
+        with:
+          packages: '' # 关键：设为空，跳过安装已废弃的 tools 包，避免许可证交互卡住
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -37,12 +38,10 @@ jobs:
       - name: Build Android APK
         run: pnpm android:build
         env:
-          # 如果项目需要，在这里配置 ANDROID_HOME 等环境变量
           ANDROID_HOME: ${{ env.ANDROID_HOME }}
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: app-release-apk
-          # 产出的 APK 路径可能因项目结构而异，通常在此目录下
           path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
