@@ -21,7 +21,6 @@ jobs:
         with:
           packages: ''
 
-      # 1. 安装 Tauri 需要的 Android NDK，并设置 NDK_HOME
       - name: Install Android NDK
         run: |
           echo "y" | sdkmanager "ndk;27.0.12077973"
@@ -38,7 +37,6 @@ jobs:
           node-version: '22'
           cache: 'pnpm'
 
-      # 2. 安装 Rust 工具链和 Android 编译目标
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -47,9 +45,27 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # 3. 关键：初始化 Tauri Android 项目（CI 模式，避免交互卡住）
       - name: Init Tauri Android project
         run: pnpm tauri android init --ci
+
+      # --- 新增的签名配置步骤 ---
+      - name: Setup Android signing
+        run: |
+          cd src-tauri/gen/android
+          # 从 Secrets 还原密钥库文件
+          base64 -d <<< "${{ secrets.ANDROID_KEY_BASE64 }}" > $RUNNER_TEMP/keystore.jks
+          # 动态生成 keystore.properties 文件
+          echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" > keystore.properties
+          echo "password=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" >> keystore.properties
+          echo "storeFile=$RUNNER_TEMP/keystore.jks" >> keystore.properties
+          # 关键：将签名配置写入 build.gradle.kts
+          # 在 android { } 块之前插入导入语句和配置读取逻辑
+          sed -i '/^android {/i import java.io.FileInputStream\nval keystorePropertiesFile = rootProject.file("keystore.properties")\nval keystoreProperties = java.util.Properties()\nif (keystorePropertiesFile.exists()) {\n    keystoreProperties.load(FileInputStream(keystorePropertiesFile))\n}\n' app/build.gradle.kts
+          # 在 signingConfigs 块中创建 release 配置
+          sed -i '/signingConfigs {/a\        create("release") {\n            keyAlias = keystoreProperties["keyAlias"] as String\n            keyPassword = keystoreProperties["password"] as String\n            storeFile = file(keystoreProperties["storeFile"] as String)\n            storePassword = keystoreProperties["password"] as String\n        }' app/build.gradle.kts
+          # 在 buildTypes 的 release 配置中应用签名
+          sed -i '/release {/a\            signingConfig = signingConfigs.getByName("release")' app/build.gradle.kts
+      # --- 签名配置步骤结束 ---
 
       - name: Build Android APK
         run: pnpm android:build
@@ -59,5 +75,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-release-apk
+          name: app-signed-apk
           path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
