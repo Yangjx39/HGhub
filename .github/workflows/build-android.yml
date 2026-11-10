@@ -1,7 +1,7 @@
 name: Build Android APK
 
 on:
-  workflow_dispatch: # 允许你在 Actions 页面手动点击触发
+  workflow_dispatch:
 
 jobs:
   build:
@@ -19,12 +19,18 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: '' # 关键：设为空，跳过安装已废弃的 tools 包，避免许可证交互卡住
+          packages: ''
+
+      # 1. 安装 Tauri 需要的 Android NDK，并设置 NDK_HOME
+      - name: Install Android NDK
+        run: |
+          echo "y" | sdkmanager "ndk;27.0.12077973"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> $GITHUB_ENV
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10 # 项目要求 pnpm 10
+          version: 10
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -32,13 +38,23 @@ jobs:
           node-version: '22'
           cache: 'pnpm'
 
+      # 2. 安装 Rust 工具链和 Android 编译目标
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # 3. 关键：初始化 Tauri Android 项目（CI 模式，避免交互卡住）
+      - name: Init Tauri Android project
+        run: pnpm tauri android init --ci
 
       - name: Build Android APK
         run: pnpm android:build
         env:
-          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          NDK_HOME: ${{ env.NDK_HOME }}
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
