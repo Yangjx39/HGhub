@@ -1,11 +1,33 @@
 name: Build Android APK
 
+# 触发方式：网页 Actions 页面手动运行，或推送 v* 标签时自动运行
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  build-apk:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    # ── 可选：在仓库 Settings → Secrets and variables → Actions 里配置这 4 个 Secret ──
+    #   ANDROID_KEY_BASE64        : 你的 upload-keystore.jks 的 base64 文本（必须）
+    #   ANDROID_KEY_ALIAS         : 密钥别名，例如 hghub（不填默认 hghub）
+    #   ANDROID_KEYSTORE_PASSWORD : 密钥库密码（不填默认 hghub123456）
+    #   ANDROID_KEY_PASSWORD      : 密钥密码（不填则与密钥库密码相同）
+    # 不配置也能跑通：脚本会临时生成一个证书，APK 照样能安装；
+    # 但每次构建签名都不一样，覆盖安装会失败，必须先卸载旧版本。
+    env:
+      ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -13,67 +35,205 @@ jobs:
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          distribution: temurin
+          java-version: "17"
 
-      - name: Setup Android SDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: ''
+          packages: ""
 
-      - name: Install Android NDK
+      # 固定安装 NDK 和 build-tools（后面签名要用的 zipalign / apksigner 就在 build-tools 里）
+      - name: Install Android NDK and build-tools
         run: |
-          echo "y" | sdkmanager "ndk;27.0.12077973"
-          echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> $GITHUB_ENV
+          # 用 printf 而不是 yes：默认 shell 带 pipefail，yes 被 SIGPIPE 杀掉会让这一步误报失败
+          printf 'y\ny\ny\ny\ny\n' | sdkmanager "ndk;27.0.12077973" "build-tools;35.0.0"
+          {
+            echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973"
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973"
+          } >> "$GITHUB_ENV"
 
-      - name: Setup pnpm
+      - name: Set up pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 10
 
-      - name: Setup Node.js
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
-          cache: 'pnpm'
+          node-version: "22"
+          cache: "pnpm"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
 
-      - name: Install dependencies
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Init Tauri Android project
         run: pnpm tauri android init --ci
 
-      # --- 新增的签名配置步骤 ---
-      - name: Setup Android signing
+      # ── 先把签名证书准备好（放在构建之前，证书有问题几秒内就能发现）──
+      - name: Prepare signing keystore
         run: |
-          cd src-tauri/gen/android
-          # 从 Secrets 还原密钥库文件
-          base64 -d <<< "${{ secrets.ANDROID_KEY_BASE64 }}" > $RUNNER_TEMP/keystore.jks
-          # 动态生成 keystore.properties 文件
-          echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" > keystore.properties
-          echo "password=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" >> keystore.properties
-          echo "storeFile=$RUNNER_TEMP/keystore.jks" >> keystore.properties
-          # 关键：将签名配置写入 build.gradle.kts
-          # 在 android { } 块之前插入导入语句和配置读取逻辑
-          sed -i '/^android {/i import java.io.FileInputStream\nval keystorePropertiesFile = rootProject.file("keystore.properties")\nval keystoreProperties = java.util.Properties()\nif (keystorePropertiesFile.exists()) {\n    keystoreProperties.load(FileInputStream(keystorePropertiesFile))\n}\n' app/build.gradle.kts
-          # 在 signingConfigs 块中创建 release 配置
-          sed -i '/signingConfigs {/a\        create("release") {\n            keyAlias = keystoreProperties["keyAlias"] as String\n            keyPassword = keystoreProperties["password"] as String\n            storeFile = file(keystoreProperties["storeFile"] as String)\n            storePassword = keystoreProperties["password"] as String\n        }' app/build.gradle.kts
-          # 在 buildTypes 的 release 配置中应用签名
-          sed -i '/release {/a\            signingConfig = signingConfigs.getByName("release")' app/build.gradle.kts
-      # --- 签名配置步骤结束 ---
+          set -euo pipefail
 
+          KEY_ALIAS="${ANDROID_KEY_ALIAS:-hghub}"
+          STORE_PASS="${ANDROID_KEYSTORE_PASSWORD:-hghub123456}"
+          KEY_PASS="${ANDROID_KEY_PASSWORD:-$STORE_PASS}"
+          KEYSTORE="$RUNNER_TEMP/upload-keystore.jks"
+
+          if [ -n "${ANDROID_KEY_BASE64:-}" ]; then
+            printf '%s' "$ANDROID_KEY_BASE64" | tr -d '\r\n \t' | base64 --decode > "$KEYSTORE"
+            echo "🔑 使用 Secrets 中提供的固定签名证书：alias=$KEY_ALIAS"
+          else
+            keytool -genkeypair \
+              -keystore "$KEYSTORE" \
+              -storetype JKS \
+              -alias "$KEY_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$STORE_PASS" -keypass "$KEY_PASS" \
+              -dname "CN=HGhub, OU=HGhub, O=HGhub, L=NA, ST=NA, C=CN"
+            echo "⚠️ 未配置 ANDROID_KEY_BASE64：本次使用临时生成的签名证书。" \
+                 "APK 可以正常安装，但下次构建签名会变，覆盖安装会失败（需先卸载旧版本）。"
+          fi
+
+          # 提前校验：证书能打开、别名存在，否则直接在这一步报错，不用等 20 分钟编译完
+          keytool -list -keystore "$KEYSTORE" -storepass "$STORE_PASS" -alias "$KEY_ALIAS" > /dev/null
+
+          {
+            echo "SIGN_KEYSTORE=$KEYSTORE"
+            echo "SIGN_ALIAS=$KEY_ALIAS"
+            echo "SIGN_STORE_PASS=$STORE_PASS"
+            echo "SIGN_KEY_PASS=$KEY_PASS"
+          } >> "$GITHUB_ENV"
+
+      # 只构建 APK（不带 --apk 时 tauri 会同时构建 AAB，白白多花时间）
       - name: Build Android APK
-        run: pnpm android:build
-        env:
-          NDK_HOME: ${{ env.NDK_HOME }}
+        run: pnpm tauri android build --apk
+
+      # ── 关键步骤：release 包默认是 -unsigned.apk，这里做 zipalign + apksigner 签名并校验 ──
+      - name: Sign and verify APK
+        run: |
+          set -euo pipefail
+
+          APK_ROOT="src-tauri/gen/android/app/build/outputs/apk"
+          echo "== 构建产物 =="
+          find "$APK_ROOT" -type f -name '*.apk' -printf '%p  (%s bytes)\n' || true
+
+          mapfile -t ALL_APKS < <(find "$APK_ROOT" -type f -name '*.apk' | sort)
+          if [ "${#ALL_APKS[@]}" -eq 0 ]; then
+            echo "::error::构建目录里没有任何 APK，请检查上面的编译日志"
+            exit 1
+          fi
+
+          # 1) 优先用 Gradle 已经签好的 universal 包
+          SRC=""
+          for f in "${ALL_APKS[@]}"; do
+            case "$f" in
+              *universal*release.apk) SRC="$f"; break ;;
+            esac
+          done
+          # 2) 退而求其次：任何非 unsigned 的包
+          if [ -z "$SRC" ]; then
+            for f in "${ALL_APKS[@]}"; do
+              case "$f" in
+                *-unsigned.apk) ;;
+                *) SRC="$f"; break ;;
+              esac
+            done
+          fi
+          # 3) 最后才用 unsigned 的包（正常情况下就是它，需要我们自己签）
+          if [ -z "$SRC" ]; then
+            for f in "${ALL_APKS[@]}"; do
+              case "$f" in
+                *-unsigned.apk) SRC="$f"; break ;;
+              esac
+            done
+          fi
+          if [ -z "$SRC" ]; then
+            echo "::error::没有可用的 APK"
+            exit 1
+          fi
+          echo "选中的产物：$SRC"
+
+          BUILD_TOOLS_DIR="$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -n 1 || true)"
+          APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
+          ZIPALIGN="$BUILD_TOOLS_DIR/zipalign"
+          if [ ! -x "$APKSIGNER" ] || [ ! -x "$ZIPALIGN" ]; then
+            echo "::error::找不到 apksigner / zipalign（$BUILD_TOOLS_DIR），无法签名"
+            exit 1
+          fi
+          echo "build-tools：$BUILD_TOOLS_DIR"
+
+          VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version" 2>/dev/null || echo '0.0.0')"
+          mkdir -p dist-apk
+          OUT="dist-apk/HGhub_${VERSION}_universal.apk"
+
+          if [ "${SRC%-unsigned.apk}" != "$SRC" ]; then
+            echo "→ 该 APK 未签名，开始签名"
+            ALIGNED="$RUNNER_TEMP/app-aligned.apk"
+            # 依次尝试：16KB 页对齐（Android 15+ 16KB 页设备）→ 4KB 页对齐 → 普通 4 字节对齐
+            ALIGN_OK=0
+            for ZIP_FLAGS in "-p -P 16" "-p" ""; do
+              # 这里故意不加引号，让 $ZIP_FLAGS 展开成多个参数
+              if "$ZIPALIGN" $ZIP_FLAGS -f 4 "$SRC" "$ALIGNED" > /dev/null 2>&1; then
+                echo "zipalign 参数：[${ZIP_FLAGS}]"
+                ALIGN_OK=1
+                break
+              fi
+            done
+            if [ "$ALIGN_OK" != "1" ]; then
+              echo "::error::zipalign 对齐失败"
+              exit 1
+            fi
+            "$APKSIGNER" sign \
+              --ks "$SIGN_KEYSTORE" \
+              --ks-key-alias "$SIGN_ALIAS" \
+              --ks-pass "env:SIGN_STORE_PASS" \
+              --key-pass "env:SIGN_KEY_PASS" \
+              --v1-signing-enabled true \
+              --v2-signing-enabled true \
+              --v3-signing-enabled true \
+              --out "$OUT" "$ALIGNED"
+          else
+            echo "→ 该 APK 已带签名，直接复用"
+            cp "$SRC" "$OUT"
+          fi
+
+          echo "== 校验签名 =="
+          "$APKSIGNER" verify --verbose --print-certs "$OUT"
+
+          # 用 sed 而不是 head：head 提前退出会让 apksigner 收到 SIGPIPE，在 pipefail 下导致整步失败
+          CERT_INFO="$("$APKSIGNER" verify --print-certs "$OUT" | sed -n '1,5p')"
+
+          {
+            echo "### ✅ APK 已签名，可直接安装"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 文件 | \`$(basename "$OUT")\` |"
+            echo "| 大小 | $(du -h "$OUT" | cut -f1) |"
+            echo "| SHA256 | \`$(sha256sum "$OUT" | cut -d' ' -f1)\` |"
+            echo ""
+            echo "签名证书："
+            echo '```'
+            printf '%s\n' "$CERT_INFO"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-signed-apk
-          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          name: HGhub-Android-APK
+          path: dist-apk/*.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
